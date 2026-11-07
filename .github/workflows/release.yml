@@ -1,0 +1,419 @@
+name: Release
+
+# Builds the private source (SOA-DevRenodor/Sandstorm-Online-Adventures-Source)
+# on this public repository's free standard runners and publishes the programs
+# to this repository's rolling `dev` release, exactly as the source repository's
+# Dev build did: the same file names, labels, update.txt format and upload order
+# (programs and notes first, update.txt last).
+#
+# Only the owner (anyone with write access) can start it: Actions > Release >
+# Run workflow. It never runs for pull requests, so forks never see the secret.
+#
+# The source stays private: it is checked out with the read-only secret
+# SOURCE_READ_TOKEN into the runner, never uploaded (the artifacts are the
+# finished programs only), never cached, and compiler/test output is kept off
+# this public log (`quiet` prints file:line messages, never source lines).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source branch, tag or commit to build"
+        required: true
+        default: master
+      publish:
+        description: "Publish to the dev release (off: build and test only)"
+        type: boolean
+        default: false
+      mode:
+        description: "build: programs and notes. notes: release notes only. news: launcher news only"
+        type: choice
+        options: [build, notes, news]
+        default: build
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPOSITORY: SOA-DevRenodor/Sandstorm-Online-Adventures-Source
+  RUST_TOOLCHAIN: 1.99.1
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Check the source credential
+        env:
+          TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: test -n "$TOKEN" || { echo "::error::Add the SOURCE_READ_TOKEN secret (Settings > Secrets and variables > Actions)."; exit 1; }
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          ref: ${{ inputs.ref }}
+          path: src
+          persist-credentials: false
+      - id: sha
+        run: echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: source
+    if: inputs.mode == 'build'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-22.04
+          - os: windows
+            runner: windows-2022
+          - os: macos
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    name: build (${{ matrix.os }})
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    env:
+      # What the programs carry (crates/eqoa/src/update.rs, launcher_update.rs):
+      # unchanged from the source repository's Dev build. The commit is the
+      # SOURCE commit, never this repository's.
+      EQOA_UPDATE_CHANNEL: dev
+      EQOA_BUILD_COMMIT: ${{ needs.source.outputs.sha }}
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      EQOA_RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/dev/
+      EQOA_LAUNCHER_NEWS_URL: https://github.com/${{ github.repository }}/releases/download/dev/launcher-news.json
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          ref: ${{ needs.source.outputs.sha }}
+          path: src
+          persist-credentials: false
+
+      - name: Keep build output off the public log
+        working-directory: ${{ runner.temp }}
+        run: |
+          cat > quiet.sh <<'EOF'
+          # quiet CMD...: the command's whole output goes to a file on the
+          # runner; success prints a summary, failure only file:line messages
+          quiet() {
+            local log
+            log=$(mktemp)
+            if "$@" > "$log" 2>&1; then
+              awk '/^test result:/ {p+=$4; f+=$6; i+=$8; n++} END {if (n) printf "tests: %d passed, %d failed, %d ignored\n", p, f, i}' "$log"
+              echo "ok: $*"
+              rm -f "$log"
+            else
+              local status=$?
+              echo "::error::failed ($status): $*"
+              grep -E '^[^ ]+:[0-9]+:[0-9]+: (error|warning)|^error(\[[A-Z0-9]+\])?:|^test .* FAILED$|panicked at |^test result:|^[A-Za-z]+(Error|Exception): ' "$log" | head -150 || true
+              rm -f "$log"
+              return $status
+            fi
+          }
+          EOF
+          echo "QUIET=$PWD/quiet.sh" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        run: |
+          source "$QUIET"
+          quiet rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          quiet rustup default "$RUST_TOOLCHAIN"
+          if [ "${{ matrix.os }}" = macos ]; then quiet rustup target add aarch64-apple-darwin x86_64-apple-darwin; fi
+
+      - name: Install the Linux libraries
+        if: matrix.os == 'linux'
+        run: |
+          source "$QUIET"
+          quiet sudo apt-get update
+          quiet sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+
+      - name: Test
+        if: matrix.os == 'linux'
+        run: |
+          source "$QUIET"
+          quiet cargo test --locked --workspace --message-format=short
+
+      - name: Build
+        if: matrix.os != 'macos'
+        run: |
+          source "$QUIET"
+          quiet cargo build --release --locked -p eqoa --message-format=short
+
+      - name: Test Windows launcher
+        if: matrix.os == 'windows'
+        run: |
+          source "$QUIET"
+          quiet cargo test --locked -p eqoa --bin eqoa --message-format=short launcher::
+
+      - name: Test Windows launcher replacement and rollback
+        if: matrix.os == 'windows'
+        run: |
+          source "$QUIET"
+          quiet python tools/test-launcher-update.py target/release/eqoa.exe
+          quiet python tools/test-launcher-entry.py target/release/eqoa.exe
+          quiet python tools/test-launcher-install.py target/release/eqoa.exe
+
+      # Optional signing: configure a certificate as secrets of THIS repository
+      # (WINDOWS_SIGNING_PFX_BASE64, WINDOWS_SIGNING_PFX_PASSWORD). Unsigned otherwise.
+      - name: Sign Windows programs when a certificate is configured
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if (-not $env:SIGNING_PFX_BASE64) {
+            Write-Output 'No signing certificate configured; Windows builds will be unsigned.'
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'eqoa-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+            $signTool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signTool) { throw 'Windows SDK signtool not found' }
+            & $signTool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:SIGNING_PFX_PASSWORD target/release/eqoa.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Code signing failed' }
+            & $signTool.FullName verify /pa target/release/eqoa.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Signature verification failed' }
+          } finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+      # The 8 MB main-thread stack and the GUI subsystem (crates/eqoa/build.rs,
+      # main.rs's windows_subsystem): a build without either is refused.
+      - name: Check the stack reserve and the subsystem (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $headers = & $dumpbin.FullName /headers target\release\eqoa.exe
+          $line = ($headers | Select-String 'size of stack reserve').Line
+          Write-Output $line
+          if ($line -notmatch '^\s*800000 size of stack reserve') { throw 'eqoa.exe does not reserve an 8 MB stack' }
+          $sub = ($headers | Select-String 'subsystem \(').Line
+          Write-Output $sub
+          if ($sub -notmatch '^\s*2 subsystem \(Windows GUI\)') { throw 'eqoa.exe is not a Windows GUI program' }
+
+      - name: Build (macOS, universal)
+        if: matrix.os == 'macos'
+        run: |
+          source "$QUIET"
+          quiet cargo build --release --locked -p eqoa --target aarch64-apple-darwin --message-format=short
+          quiet cargo build --release --locked -p eqoa --target x86_64-apple-darwin --message-format=short
+          mkdir -p target/release
+          lipo -create -output target/release/eqoa \
+            target/aarch64-apple-darwin/release/eqoa target/x86_64-apple-darwin/release/eqoa
+          lipo -info target/release/eqoa
+
+      # The same packages and names as the source repository's Dev build.
+      - name: Package
+        run: |
+          bin=target/release/eqoa
+          [ "${{ matrix.os }}" = windows ] && bin=target/release/eqoa.exe
+          # a program that does not carry its source commit would not follow the release
+          perl -e 'local $/; open my $f, "<:raw", $ARGV[0] or exit 2; my $b = <$f>; exit(index($b, $ENV{SOURCE_SHA}) < 0 ? 1 : 0)' "$bin" || {
+            echo "::error::$bin does not carry $SOURCE_SHA: it would not update itself"
+            exit 1
+          }
+          case "${{ matrix.os }}" in
+            linux) name=Sandstorm-Online-Adventure-Linux-x86_64 ;;
+            windows) name="Sandstorm Online Adventure" ;;
+            macos) name=Sandstorm-Online-Adventure-macOS ;;
+          esac
+          out="$(cd "$RUNNER_TEMP" && pwd)/out"
+          mkdir -p "dist/$name" "$out"
+          if [ "${{ matrix.os }}" = windows ]; then
+            cp target/release/eqoa.exe "dist/$name/Sandstorm Online Adventure.exe"
+            touch "dist/$name/portable.opt"
+            cp release/launcher.ini "dist/$name/"
+            cp launcher/TEXTURE-PACKS.md "dist/$name/"
+            sed 's/$/\r/' release/README.txt > "dist/$name/README.txt"
+            sed 's/$/\r/' LICENSE > "dist/$name/LICENSE.txt"
+            (cd dist && 7z a -tzip "$out/Sandstorm.Online.Adventure.zip" "$name" > /dev/null)
+            cp target/release/eqoa.exe "$out/Sandstorm.Online.Adventure.exe"
+            cp "$out/Sandstorm.Online.Adventure.exe" "$out/Sandstorm.Online.Adventure.Launcher.exe"
+            cp "$out/Sandstorm.Online.Adventure.zip" "$out/Sandstorm.Online.Adventure.Launcher.zip"
+          else
+            cp target/release/eqoa "dist/$name/"
+            chmod +x "dist/$name/eqoa"
+            cp release/README.txt LICENSE "dist/$name/"
+            if [ "${{ matrix.os }}" = linux ]; then
+              target/release/eqoa icon 256 "dist/$name/eqoa.png" > /dev/null 2>&1 || echo "no eqoa.png: the archive goes without it"
+            fi
+            tar -C dist -czf "$out/$name.tar.gz" "$name"
+            cp target/release/eqoa "$out/$name"
+          fi
+          ls -la "$out"
+
+      # The finished programs only (no source), for the publish job; deleted
+      # by the cleanup job once the release has them.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [source, build]
+    if: inputs.publish && inputs.mode == 'build'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+    steps:
+      # the source's history and notes: release/notes.sh tells this build from the last
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          ref: ${{ needs.source.outputs.sha }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The previous build is the commit the live update.txt names.
+      - name: Write the release notes
+        run: |
+          prev=$(curl -fsSL "https://github.com/$GH_REPO/releases/download/dev/update.txt" | sed -n 's/^commit //p' || true)
+          git -C src cat-file -e "$prev^{commit}" 2>/dev/null || prev=""
+          (cd src && DOWNLOADS_REPOSITORY="$GH_REPO" bash release/notes.sh "$SOURCE_SHA" "$prev") > notes.md
+          echo "notes: $(wc -l < notes.md) lines; previous build ${prev:-none}"
+          ls -la dist
+
+      # The updater's manifest (crates/eqoa/src/update.rs), unchanged in format.
+      - name: Write update.txt
+        run: |
+          {
+            echo "version dev-${SOURCE_SHA::7}"
+            echo "commit $SOURCE_SHA"
+            for b in linux-x86_64:Sandstorm-Online-Adventure-Linux-x86_64 unified-windows-x86_64:Sandstorm.Online.Adventure.exe macos:Sandstorm-Online-Adventure-macOS; do
+              f="dist/${b#*:}"
+              echo "build ${b%%:*} ${b#*:} $(sha256sum "$f" | cut -d' ' -f1) $(stat -c%s "$f")"
+            done
+            # Old installed launchers/clients migrate to the SAME unified file.
+            f="dist/Sandstorm.Online.Adventure.exe"
+            for component in windows-x86_64 launcher-windows-x86_64; do
+              echo "build $component ${f#dist/} $(sha256sum "$f" | cut -d' ' -f1) $(stat -c%s "$f")"
+            done
+          } > update.txt
+          cat update.txt
+
+      - name: The update notes for the game
+        run: |
+          cp src/UPDATE-NOTES.md dist/update-notes.md
+          grep -c '^## ' dist/update-notes.md
+
+      - name: Publish
+        run: |
+          gh release view dev > /dev/null 2>&1 || \
+            gh release create dev --prerelease --title "Dev build" --notes-file notes.md
+          # an asset no longer built goes too
+          for old in $(gh release view dev --json assets --jq '.assets[].name'); do
+            [ -e "dist/$old" ] || [ "$old" = update.txt ] || [ "$old" = launcher-news.json ] || gh release delete-asset dev "$old" --yes
+          done
+          gh release upload dev --clobber dist/*
+          # GitHub normalizes spaces in asset names; display the friendly brand.
+          for ext in exe zip; do
+            id=$(gh api "repos/$GH_REPO/releases/tags/dev" --jq ".assets[] | select(.name == \"Sandstorm.Online.Adventure.$ext\") | .id")
+            gh api --method PATCH "repos/$GH_REPO/releases/assets/$id" -f "label=Sandstorm Online Adventure.$ext" > /dev/null
+          done
+          # the manifest after the programs it names and the notes
+          gh release upload dev --clobber update.txt
+          if [ "${{ github.actor }}" = "${{ github.repository_owner }}" ]; then
+            (cd src && python3 tools/launcher-news.py --validate > /dev/null)
+            cp src/launcher/news.json launcher-news.json
+            gh release upload dev --clobber launcher-news.json
+          fi
+          gh release edit dev --prerelease --title "Dev build" --notes-file notes.md
+
+  # Notes only (the source repository's notes.yml): the release page's notes
+  # and the game's update-notes.md again, for the build already published.
+  notes:
+    needs: source
+    if: inputs.publish && inputs.mode == 'notes'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          ref: ${{ needs.source.outputs.sha }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Write the release page's notes again
+        run: |
+          body=$(gh release view dev --json body --jq .body)
+          build=$(curl -fsSL "https://github.com/$GH_REPO/releases/download/dev/update.txt" | sed -n 's/^commit //p')
+          prev=$(printf '%s\n' "$body" | tr -d '\r' | sed -n 's/^<!-- notes: build=[0-9a-f]* previous=\([0-9a-f]*\) -->$/\1/p')
+          (cd src && DOWNLOADS_REPOSITORY="$GH_REPO" bash release/notes.sh "$build" "$prev") > notes.md
+          gh release edit dev --notes-file notes.md
+          cp src/UPDATE-NOTES.md update-notes.md
+          gh release upload dev --clobber update-notes.md
+
+  # News only (the source repository's launcher-news.yml).
+  news:
+    needs: source
+    if: inputs.publish && inputs.mode == 'news' && github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          ref: ${{ needs.source.outputs.sha }}
+          path: src
+          persist-credentials: false
+      - name: Publish without a client rebuild
+        run: |
+          (cd src && python3 tools/launcher-news.py --validate > /dev/null)
+          cp src/launcher/news.json launcher-news.json
+          gh release upload dev --clobber launcher-news.json
+
+  # The run's copies of the programs would be a second place to download them.
+  cleanup:
+    needs: [build, publish]
+    if: always() && inputs.mode == 'build'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete the run's artifacts
+        run: |
+          for id in $(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].id'); do
+            gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$id"
+          done
