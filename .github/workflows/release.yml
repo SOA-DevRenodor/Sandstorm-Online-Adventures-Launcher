@@ -53,7 +53,17 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
+      platforms: ${{ steps.platforms.outputs.list }}
     steps:
+      # the platforms to build: macOS only with the Build macOS switch on
+      - id: platforms
+        env:
+          MACOS: ${{ inputs.macos }}
+        run: |
+          list='[{"os":"linux","runner":"ubuntu-22.04"},{"os":"windows","runner":"windows-2022"}'
+          [ "$MACOS" = false ] || list="$list"',{"os":"macos","runner":"macos-15"}'
+          echo "list=$list]" >> "$GITHUB_OUTPUT"
+          echo "platforms: $list]"
       - name: Check the source credential
         env:
           TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
@@ -74,16 +84,8 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - os: linux
-            runner: ubuntu-22.04
-          - os: windows
-            runner: windows-2022
-          - os: macos
-            runner: macos-15
-        # with macOS off (GitHub short of Mac runners), it is not built at all
-        exclude:
-          - os: ${{ inputs.macos && 'none' || 'macos' }}
+        # linux, windows and (with the Build macOS switch on) macos: the source job's list
+        include: ${{ fromJSON(needs.source.outputs.platforms) }}
     runs-on: ${{ matrix.runner }}
     name: build (${{ matrix.os }})
     defaults:
