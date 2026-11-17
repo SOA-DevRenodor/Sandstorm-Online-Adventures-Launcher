@@ -25,6 +25,10 @@ on:
         description: "Publish to the dev release (off: build and test only)"
         type: boolean
         default: false
+      macos:
+        description: "Build macOS (off: publish Linux and Windows only; Macs keep the build they have)"
+        type: boolean
+        default: true
       mode:
         description: "build: programs and notes. notes: release notes only. news: launcher news only"
         type: choice
@@ -77,6 +81,9 @@ jobs:
             runner: windows-2022
           - os: macos
             runner: macos-15
+        # with macOS off (GitHub short of Mac runners), it is not built at all
+        exclude:
+          - os: ${{ inputs.macos && 'none' || 'macos' }}
     runs-on: ${{ matrix.runner }}
     name: build (${{ matrix.os }})
     defaults:
@@ -309,6 +316,8 @@ jobs:
             echo "commit $SOURCE_SHA"
             for b in linux-x86_64:Sandstorm-Online-Adventure-Linux-x86_64 unified-windows-x86_64:Sandstorm.Online.Adventure.exe macos:Sandstorm-Online-Adventure-macOS; do
               f="dist/${b#*:}"
+              # a platform not built this time is left out: its players keep what they have
+              [ -e "$f" ] || { echo "no ${b%%:*} build this time" >&2; continue; }
               echo "build ${b%%:*} ${b#*:} $(sha256sum "$f" | cut -d' ' -f1) $(stat -c%s "$f")"
             done
             # Old installed launchers/clients migrate to the SAME unified file.
@@ -330,7 +339,9 @@ jobs:
             gh release create dev --prerelease --title "Dev build" --notes-file notes.md
           # an asset no longer built goes too
           for old in $(gh release view dev --json assets --jq '.assets[].name'); do
-            [ -e "dist/$old" ] || [ "$old" = update.txt ] || [ "$old" = launcher-news.json ] || gh release delete-asset dev "$old" --yes
+            [ -e "dist/$old" ] || [ "$old" = update.txt ] || [ "$old" = launcher-news.json ] || \
+              { [ "${{ inputs.macos }}" = false ] && case "$old" in Sandstorm-Online-Adventure-macOS*) true ;; *) false ;; esac; } || \
+              gh release delete-asset dev "$old" --yes
           done
           gh release upload dev --clobber dist/*
           # GitHub normalizes spaces in asset names; display the friendly brand.
