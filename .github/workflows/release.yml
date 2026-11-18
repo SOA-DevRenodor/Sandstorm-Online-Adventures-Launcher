@@ -29,6 +29,10 @@ on:
         description: "Build macOS (off: publish Linux and Windows only; Macs keep the build they have)"
         type: boolean
         default: true
+      macos_only:
+        description: "macOS only: build just macOS for the commit already published and add it (Windows, Linux and the notes untouched)"
+        type: boolean
+        default: false
       mode:
         description: "build: programs and notes. notes: release notes only. news: launcher news only"
         type: choice
@@ -59,11 +63,17 @@ jobs:
       - id: platforms
         env:
           MACOS: ${{ inputs.macos }}
+          MACOS_ONLY: ${{ inputs.macos_only }}
         run: |
-          list='[{"os":"linux","runner":"ubuntu-22.04"},{"os":"windows","runner":"windows-2022"}'
-          [ "$MACOS" = false ] || list="$list"',{"os":"macos","runner":"macos-15"}'
-          echo "list=$list]" >> "$GITHUB_OUTPUT"
-          echo "platforms: $list]"
+          if [ "$MACOS_ONLY" = true ]; then
+            list='[{"os":"macos","runner":"macos-15"}]'
+          else
+            list='[{"os":"linux","runner":"ubuntu-22.04"},{"os":"windows","runner":"windows-2022"}'
+            [ "$MACOS" = false ] || list="$list"',{"os":"macos","runner":"macos-15"}'
+            list="$list]"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          echo "platforms: $list"
       - name: Check the source credential
         env:
           TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
@@ -303,6 +313,7 @@ jobs:
 
       # The previous build is the commit the live update.txt names.
       - name: Write the release notes
+        if: ${{ !inputs.macos_only }}
         run: |
           prev=$(curl -fsSL "https://github.com/$GH_REPO/releases/download/dev/update.txt" | sed -n 's/^commit //p' || true)
           git -C src cat-file -e "$prev^{commit}" 2>/dev/null || prev=""
@@ -311,7 +322,27 @@ jobs:
           ls -la dist
 
       # The updater's manifest (crates/eqoa/src/update.rs), unchanged in format.
+      # macOS only: the live manifest kept, its macOS line made this build's; only for
+      # the commit it already names (a Mac never gets a build the others do not have)
+      - name: Write update.txt (macOS only)
+        if: ${{ inputs.macos_only }}
+        run: |
+          curl -fsSL "https://github.com/$GH_REPO/releases/download/dev/update.txt" -o live.txt
+          live=$(sed -n 's/^commit //p' live.txt)
+          [ "$live" = "$SOURCE_SHA" ] || { echo "::error::The release is at ${live:-nothing}, not $SOURCE_SHA: publish Windows and Linux for this commit first."; exit 1; }
+          f=dist/Sandstorm-Online-Adventure-macOS
+          test -e "$f"
+          { grep -v '^build macos ' live.txt; echo "build macos ${f#dist/} $(sha256sum "$f" | cut -d' ' -f1) $(stat -c%s "$f")"; } > update.txt
+          cat update.txt
+
+      - name: Publish (macOS only)
+        if: ${{ inputs.macos_only }}
+        run: |
+          gh release upload dev --clobber dist/Sandstorm-Online-Adventure-macOS*
+          gh release upload dev --clobber update.txt
+
       - name: Write update.txt
+        if: ${{ !inputs.macos_only }}
         run: |
           {
             echo "version dev-${SOURCE_SHA::7}"
@@ -331,11 +362,13 @@ jobs:
           cat update.txt
 
       - name: The update notes for the game
+        if: ${{ !inputs.macos_only }}
         run: |
           cp src/UPDATE-NOTES.md dist/update-notes.md
           grep -c '^## ' dist/update-notes.md
 
       - name: Publish
+        if: ${{ !inputs.macos_only }}
         run: |
           gh release view dev > /dev/null 2>&1 || \
             gh release create dev --prerelease --title "Dev build" --notes-file notes.md
