@@ -61,7 +61,7 @@ jobs:
           MACOS: ${{ inputs.macos }}
         run: |
           list='[{"os":"linux","runner":"ubuntu-22.04"},{"os":"windows","runner":"windows-2022"}'
-          [ "$MACOS" = false ] || list="$list"',{"os":"macos","runner":"macos-15"}'
+          [ "$MACOS" = false ] || list="$list"',{"os":"macos","runner":"macos-14"}'
           echo "list=$list]" >> "$GITHUB_OUTPUT"
           echo "platforms: $list]"
       - name: Check the source credential
